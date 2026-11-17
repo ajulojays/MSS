@@ -1,0 +1,50 @@
+#!/bin/bash
+# Real-data MSS V1 pipeline as chained SLURM jobs (afterok dependencies).
+#
+#   slurm/run_pipeline.sh --taxa-file taxa.txt [--workdir run1] [--threads 16]
+#                         [--mixtures 5000] [--embed-cmd "<cmd>" --embed-out emb.tsv]
+#
+# Steps:   1 bacdive [internet]  -> data/bacdive_reference.tsv
+#          2 genome-manifest     -> data/genome_manifest.tsv
+#          3 download-genomes [internet] -> data/labeled_genomes.tsv
+#          4 features (CPU, cached k-mers)
+#          (4b optional GPU embedding: --embed-cmd must write --embed-out with a genome_id
+#              column and dna_*/protein_*/f_* columns; MSS does not ship a foundation model)
+#          5 train  6 predict-genomes  7 train-raw (EXPERIMENTAL)
+# Only the optional embedding step requests a GPU; every MSS step itself is CPU-only.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TAXA=""; IDS=""; WORK=mss_run; THREADS=16; MIX=5000; EMBED_CMD=""; EMBED_OUT=""; EXTRA_BD=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --taxa-file) TAXA="$(realpath "$2")"; shift 2;;
+    --ids-file) IDS="$(realpath "$2")"; shift 2;;
+    --oxygen-map) EXTRA_BD+=(--oxygen-map "$(realpath "$2")"); shift 2;;
+    --workdir) WORK="$2"; shift 2;;
+    --threads) THREADS="$2"; shift 2;;
+    --mixtures) MIX="$2"; shift 2;;
+    --embed-cmd) EMBED_CMD="$2"; shift 2;;
+    --embed-out) EMBED_OUT="$2"; shift 2;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0;;
+    *) echo "unknown option $1" >&2; exit 2;;
+  esac
+done
+[[ -n "$TAXA$IDS" ]] || { echo "need --taxa-file or --ids-file" >&2; exit 2; }
+[[ -z "$EMBED_CMD" || -n "$EMBED_OUT" ]] || { echo "--embed-cmd needs --embed-out" >&2; exit 2; }
+mkdir -p "$WORK"; cd "$WORK"
+S="$DIR/submit.sh"
+SRC=(); [[ -n "$TAXA" ]] && SRC+=(--taxa-file "$TAXA"); [[ -n "$IDS" ]] && SRC+=(--ids-file "$IDS")
+j1=$($S --name mss_bacdive --cpus 1 --mem 4G --time 12:00:00 -- bacdive "${SRC[@]}" "${EXTRA_BD[@]}" --out data/bacdive_reference.tsv)
+j2=$($S --name mss_manifest --cpus 1 --mem 4G --time 00:30:00 --after "$j1" -- genome-manifest --reference data/bacdive_reference.tsv --out data/genome_manifest.tsv)
+j3=$($S --name mss_download --cpus 2 --mem 8G --time 24:00:00 --after "$j2" -- download-genomes --manifest data/genome_manifest.tsv --outdir genomes --out data/labeled_genomes.tsv)
+j4=$($S --name mss_features --cpus "$THREADS" --mem 32G --time 12:00:00 --after "$j3" -- features --manifest data/labeled_genomes.tsv --out features/kmer5.tsv.gz --threads "$THREADS")
+FEAT=(); TRAIN_AFTER="$j4"
+if [[ -n "$EMBED_CMD" ]]; then
+  j4b=$($S --gpu --name mss_embed --cpus 8 --mem 64G --time 24:00:00 --after "$j3" --cmd "$EMBED_CMD")
+  FEAT=(--embeddings "$EMBED_OUT"); TRAIN_AFTER="$j4b"
+  echo "embedding (GPU) job $j4b"
+fi
+j5=$($S --name mss_train --cpus "$THREADS" --mem 32G --time 12:00:00 --after "$TRAIN_AFTER" -- train --manifest data/labeled_genomes.tsv --out models "${FEAT[@]}" --threads "$THREADS")
+j6=$($S --name mss_predict --cpus "$THREADS" --mem 16G --time 04:00:00 --after "$j5" -- predict-genomes --manifest data/labeled_genomes.tsv --model models/phenotype_model.joblib --out results/genome_phenotype_predictions.tsv "${FEAT[@]}" --threads "$THREADS")
+j7=$($S --name mss_train_raw --cpus "$THREADS" --mem 32G --time 12:00:00 --after "$j4" -- train-raw --manifest data/labeled_genomes.tsv --out models --mixtures "$MIX" --threads "$THREADS")
+echo "workdir $(pwd)"; echo "jobs: bacdive=$j1 manifest=$j2 download=$j3 features=$j4 train=$j5 predict=$j6 train_raw=$j7"

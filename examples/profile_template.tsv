@@ -1,0 +1,6 @@
+sample_id	species	relative_abundance
+sample_A	Genus_one species_a	62.5
+sample_A	Genus_two species_b	30.0
+sample_A	Genus_three species_c	7.5
+sample_B	Genus_one species_a	0.10
+sample_B	Genus_four species_d	0.90

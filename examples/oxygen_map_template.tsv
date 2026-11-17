@@ -1,0 +1,7 @@
+raw	category
+# Extend/override how raw BacDive oxygen-tolerance strings map to MSS categories.
+# category must be one of: anaerobe facultative aerobe microaerophile aerotolerant unmapped
+# Strings NOT mapped by default (decide explicitly before using them):
+#   facultative aerobe, microaerotolerant
+# example (uncomment only if you accept this mapping):
+# facultative aerobe	facultative

@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
+      - name: offline synthetic demo
+        run: |
+          python scripts/make_demo.py
+          mss taxa --profile demo_generated/profile.tsv --reference demo_generated/phenotypes.tsv --out results/demo_taxa.tsv
+          mss train --manifest demo_generated/genomes.tsv --out models/demo
+          mss predict-genomes --manifest demo_generated/genomes.tsv --model models/demo/phenotype_model.joblib --out results/demo_genome_predictions.tsv
+          mss train-raw --manifest demo_generated/genomes.tsv --out models/demo --mixtures 250
+          mss raw --fastq demo_generated/reads.fastq --model models/demo/raw_mixture.joblib --out results/demo_raw.tsv

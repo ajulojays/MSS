@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below. MSS is an unvalidated research prototype."
+title: "MSS: Microbiome State Score"
+abstract: "Phenotype-informed estimation of microbiome oxygen-tolerance composition from taxonomic profiles and (experimentally) raw shotgun reads."
+type: software
+authors:
+  - family-names: Ajulo
+    given-names: Samuel
+version: 0.1.0
+date-released: 2026-11-17
+license: MIT
+repository-code: "https://github.com/ajulojays/MSS"
+references:
+  - type: database
+    title: "BacDive, the Bacterial Diversity Metadatabase"
+    url: "https://bacdive.dsmz.de/"
