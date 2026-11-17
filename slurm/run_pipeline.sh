@@ -53,7 +53,7 @@ j1=$($S --name mss_bacdive --cpus 1 --mem 16G --time 2-00:00:00 -- bacdive "${SR
 # GTDB metadata download (internet) runs in parallel with the BacDive scan.
 jg=$($S --name mss_gtdb --cpus 1 --mem 2G --time 02:00:00 --cmd "mkdir -p $GTDB_DIR && cd $GTDB_DIR && for f in bac120_metadata_r226.tsv.gz ar53_metadata_r226.tsv.gz; do [ -s \$f ] || { curl -fsSL -o \$f.part $GTDB_URL/\$f && mv \$f.part \$f; }; done && ls -la")
 j2=$($S --name mss_manifest --cpus 1 --mem 16G --time 01:00:00 --after "$j1:$jg" -- genome-manifest --reference data/bacdive_reference.tsv --out data/genome_manifest.tsv "${LABELED[@]}" --gtdb-metadata "${GTDB_FILES[@]}" "${REPS[@]}")
-j3=$($S --name mss_download --cpus 2 --mem 8G --time 4-00:00:00 --after "$j2" -- download-genomes --manifest data/genome_manifest.tsv --outdir genomes --out data/labeled_genomes.tsv --batch-size 100)
+j3=$($S --name mss_download --cpus 8 --mem 16G --time 2-00:00:00 --after "$j2" -- download-genomes --manifest data/genome_manifest.tsv --outdir genomes --out data/labeled_genomes.tsv --batch-size 25 --workers 16)
 j4=$($S --name mss_features --cpus "$THREADS" --mem 32G --time 2-00:00:00 --after "$j3" -- features --manifest data/labeled_genomes.tsv --out features/kmer5.tsv.gz --threads "$THREADS")
 FEAT=(); TRAIN_AFTER="$j4"
 if [[ -n "$EMBED_CMD" ]]; then

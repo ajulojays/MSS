@@ -166,7 +166,8 @@ def cmd_download_genomes(a):
     m = pd.read_csv(a.manifest, sep="\t", dtype=str, keep_default_na=False)
     if a.limit:
         m = m.head(a.limit)
-    ok, fails = download_genomes(m, a.outdir, batch_size=a.batch_size, datasets_bin=a.datasets_bin)
+    ok, fails = download_genomes(m, a.outdir, batch_size=a.batch_size, datasets_bin=a.datasets_bin,
+                                 workers=a.workers)
     _write_tsv(ok, a.out)
     _write_tsv(fails, Path(a.out).with_suffix(".failures.tsv"))
     log.info("%d genomes ready, %d failed", len(ok), len(fails))
@@ -368,6 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=50)
     p.add_argument("--limit", type=int, help="only the first N rows (testing)")
     p.add_argument("--datasets-bin", default="datasets")
+    p.add_argument("--workers", type=int, default=8, help="concurrent NCBI Datasets batch downloads")
     p.set_defaults(func=cmd_download_genomes)
 
     p = sub.add_parser("features", help=f"{OFFLINE} precompute/cache genome k-mer features")

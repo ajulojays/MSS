@@ -199,16 +199,34 @@ def _datasets_batch(accessions: list[str], outdir: Path, datasets_bin: str) -> d
                 if match is None:
                     continue
                 dest = outdir / f"{match}.fna.gz"
+                part = dest.with_name(dest.name + ".part")
                 import gzip
-                with z.open(name) as src, gzip.open(dest, "wb") as dst:
+                with z.open(name) as src, gzip.open(part, "wb", compresslevel=6) as dst:
                     shutil.copyfileobj(src, dst)
+                part.replace(dest)  # atomic: a killed job never leaves a truncated .fna.gz
                 res[match] = ""
     return res
 
 
+def _fetch_batch(batch: list[str], outdir: Path, datasets_bin: str) -> dict[str, str]:
+    res = _datasets_batch(batch, outdir, datasets_bin)
+    failed = [acc for acc, e in res.items() if e]
+    if len(batch) > 1 and len(failed) == len(batch):
+        # whole batch failed (e.g. one invalid accession or a transient error): retry one by one
+        log.warning("batch failed (%s); retrying %d accessions individually", res[batch[0]], len(batch))
+        for acc in batch:
+            res.update(_datasets_batch([acc], outdir, datasets_bin))
+    return res
+
+
 def download_genomes(manifest: pd.DataFrame, outdir: str | Path, batch_size: int = 50,
-                     datasets_bin: str = "datasets", skip_existing: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fetch genomes for manifest rows; returns (clean labeled manifest, failure table)."""
+                     datasets_bin: str = "datasets", skip_existing: bool = True,
+                     workers: int = 1) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch genomes for manifest rows; returns (clean labeled manifest, failure table).
+
+    ``workers`` > 1 runs that many NCBI Datasets batch downloads concurrently.
+    Setting NCBI_API_KEY in the environment raises NCBI's request-rate limit.
+    """
     if shutil.which(datasets_bin) is None:
         raise FileNotFoundError(f"NCBI Datasets CLI {datasets_bin!r} not on PATH "
                                 "(conda install -c conda-forge ncbi-datasets-cli)")
@@ -218,18 +236,23 @@ def download_genomes(manifest: pd.DataFrame, outdir: str | Path, batch_size: int
     m["genome_fasta"] = [str(outdir / f"{a}.fna.gz") for a in m["accession"]]
     todo = [a for a, f in zip(m["accession"], m["genome_fasta"])
             if not (skip_existing and Path(f).exists() and validate_fasta(f)[0])]
+    for stale in outdir.glob("*.fna.gz.part"):
+        stale.unlink()
     errors: dict[str, str] = {}
-    for s in range(0, len(todo), batch_size):
-        batch = todo[s:s + batch_size]
-        log.info("downloading %d-%d of %d", s + 1, s + len(batch), len(todo))
-        res = _datasets_batch(batch, outdir, datasets_bin)
-        failed = [acc for acc, e in res.items() if e]
-        if len(batch) > 1 and len(failed) == len(batch):
-            # whole batch failed (e.g. one invalid accession): retry one by one
-            log.warning("batch failed (%s); retrying %d accessions individually", res[batch[0]], len(batch))
-            for acc in batch:
-                res.update(_datasets_batch([acc], outdir, datasets_bin))
-        errors.update(res)
+    batches = [todo[s:s + batch_size] for s in range(0, len(todo), batch_size)]
+    workers = max(1, workers)
+    log.info("%d genomes to download in %d batches of <=%d with %d parallel workers (%d already present)",
+             len(todo), len(batches), batch_size, workers, len(m) - len(todo))
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_fetch_batch, b, outdir, datasets_bin) for b in batches]
+        for f in as_completed(futs):
+            res = f.result()
+            errors.update(res)
+            done += len(res)
+            log.info("downloaded %d/%d (%d failed so far)", done, len(todo),
+                     sum(1 for e in errors.values() if e))
     fails, ok_rows, seen_hash = [], [], {}
     for r in m.to_dict("records"):
         err = errors.get(r["accession"], "")
