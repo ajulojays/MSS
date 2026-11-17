@@ -62,14 +62,23 @@ def test_conflict_preserved_not_voted():
     assert r["oxygen_raw"] == "anaerobe; anaerobe; aerobe"
 
 
+def test_owner_mapped_terms():
+    fa = parse_record(1, rec(oxygen={"@ref": 1, "oxygen tolerance": "facultative aerobe"}))
+    assert fa["oxygen"] == "facultative" and fa["oxygen_raw"] == "facultative aerobe"
+    mt = parse_record(2, rec(oxygen={"@ref": 1, "oxygen tolerance": "microaerotolerant"}))
+    assert mt["oxygen"] == "microaerophile" and mt["oxygen_raw"] == "microaerotolerant"
+
+
 def test_unmapped_strings_left_empty_and_overridable(tmp_path):
-    r = parse_record(1, rec(oxygen={"@ref": 1, "oxygen tolerance": "facultative aerobe"}))
-    assert r["oxygen"] == "" and r["oxygen_unmapped"] == "facultative aerobe"
+    r = parse_record(1, rec(oxygen={"@ref": 1, "oxygen tolerance": "oxygen-sensitive thing"}))
+    assert r["oxygen"] == "" and r["oxygen_unmapped"] == "oxygen-sensitive thing"
     p = tmp_path / "map.tsv"
-    p.write_text("raw\tcategory\nfacultative aerobe\tfacultative\n")
-    r2 = parse_record(1, rec(oxygen={"@ref": 1, "oxygen tolerance": "facultative aerobe"}),
-                      load_oxygen_map(p))
-    assert r2["oxygen"] == "facultative"
+    p.write_text("raw\tcategory\noxygen-sensitive thing\tanaerobe\nmicroaerotolerant\tunmapped\n")
+    m = load_oxygen_map(p)
+    r2 = parse_record(1, rec(oxygen={"@ref": 1, "oxygen tolerance": "oxygen-sensitive thing"}), m)
+    assert r2["oxygen"] == "anaerobe"
+    r3 = parse_record(1, rec(oxygen={"@ref": 1, "oxygen tolerance": "microaerotolerant"}), m)
+    assert r3["oxygen"] == "" and r3["oxygen_unmapped"] == "microaerotolerant"
 
 
 def test_missing_is_not_negative():

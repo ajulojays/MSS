@@ -157,11 +157,12 @@ Each job log records the host, CPUs, GPUs, and `/usr/bin/time -v` peak memory an
 * **Predictions are not ground truth.** BacDive's `Genome-based predictions` section is ignored.
   Model probabilities enter MSS-Taxa only for species with no measured oxygen label, and the
   output reports how much of each sample they cover (`model_inferred_pct`).
-* **Unmapped strings are reported, not guessed.** Only BacDive strings that literally name an
-  MSS category (optionally with obligate/strict) are mapped; see `mss/ontology.py`. Others,
-  e.g. `facultative aerobe` and `microaerotolerant`, are left empty and listed in
-  `bacdive_reference.summary.json`. Map them explicitly with
-  `--oxygen-map` (template: `examples/oxygen_map_template.tsv`).
+* **Unmapped strings are reported, not guessed.** BacDive strings that literally name an MSS
+  category (optionally with obligate/strict) are mapped. Two more are mapped by project decision:
+  `facultative aerobe` → `facultative` and `microaerotolerant` → `microaerophile`. The raw
+  string is always kept in `oxygen_raw`. See `mss/ontology.py`. Any other string is left empty
+  and listed in `bacdive_reference.summary.json`. Override or extend the mapping with
+  `--oxygen-map` (template: `examples/oxygen_map_template.tsv`; map a term to `unmapped` to undo a default).
 * **Unmatched taxa are kept** as `unresolved_pct`. Each sample's categories plus unresolved sum to 100%.
 * **Species matching** is normalized exact-name matching (case, `s__` prefix, `_`/space).
   GTDB suffixes are kept (`Blautia_A` ≠ `Blautia`). The per-taxon audit table shows every

@@ -14,9 +14,11 @@ from pathlib import Path
 OXYGEN_CLASSES = ["anaerobe", "facultative", "aerobe", "microaerophile", "aerotolerant"]
 
 # BacDive raw oxygen-tolerance string (lower-cased, whitespace-collapsed) -> MSS category.
-# Only strings that are lexically the specification's categories, or those categories with an
-# explicit obligate/strict qualifier, are mapped. Everything else (e.g. "facultative aerobe",
-# "microaerotolerant") is reported as unmapped so the user decides, rather than the code.
+# Strings that are lexically the specification's categories, or those categories with an
+# explicit obligate/strict qualifier, are mapped. Two further BacDive terms are mapped by the
+# project owner's decision (2026-11-17): "facultative aerobe" -> facultative and
+# "microaerotolerant" -> microaerophile. Any other string is reported as unmapped so the user
+# decides, rather than the code. The raw string is always kept in ``oxygen_raw``.
 DEFAULT_OXYGEN_MAP = {
     "anaerobe": "anaerobe",
     "obligate anaerobe": "anaerobe",
@@ -30,6 +32,9 @@ DEFAULT_OXYGEN_MAP = {
     "microaerophile": "microaerophile",
     "aerotolerant": "aerotolerant",
     "aerotolerant anaerobe": "aerotolerant",
+    # project-owner decisions (2026-11-17)
+    "facultative aerobe": "facultative",
+    "microaerotolerant": "microaerophile",
 }
 
 # Binary / categorical traits: BacDive value -> MSS label. Values not listed are unmapped.
