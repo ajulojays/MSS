@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from mss.bacdive import BacDiveClient, build_reference, parse_record, summarize_reference
-from mss.genomes import make_manifest
+from mss.genomes import acc_key, load_gtdb, make_manifest
 from mss.ontology import load_oxygen_map, normalize_species
 
 
@@ -120,7 +120,13 @@ def test_genomes_and_manifest():
     assert ref.loc[0, "genome_accession"] == "GCA_2"
     assert ref.loc[0, "all_genome_accessions"] == "GCA_1;GCA_2"
     m, dup = make_manifest(ref)
-    assert list(m["accession"]) == ["GCA_2"] and len(dup) == 1
+    assert list(m["accession"]) == ["GCA_2"] and len(dup) == 2  # both strains logged
+    assert m.loc[0, "oxygen"] == "aerobe"                        # agreeing/one-sided label kept
+    assert m.loc[0, "bacdive_id"] == "1;2"
+    m2, _ = make_manifest(ref, require_label=["oxygen"])
+    assert list(m2["accession"]) == ["GCA_2"]  # strain 1 has an oxygen label
+    m3, _ = make_manifest(ref.assign(oxygen=""), require_label=["oxygen"])
+    assert m3.empty
     s = summarize_reference(ref)
     assert s["n_strains"] == 3 and s["n_with_genome"] == 2
 
@@ -162,7 +168,7 @@ def test_client_retry_pagination_and_cache(tmp_path):
     assert s.urls[0].endswith("/v2/taxon/Testus/alpha")
     got = dict(c.fetch(ids))
     assert sorted(got) == [1, 2, 3]
-    assert (tmp_path / "2.json").exists()
+    assert (tmp_path / "2.json.gz").exists()
     # second fetch is served from cache: no more HTTP calls
     n = len(s.urls)
     assert sorted(dict(c.fetch([1, 2]))) == [1, 2] and len(s.urls) == n
@@ -206,3 +212,55 @@ def test_contradicted_growth_range_is_flagged():
         {"@ref": 1, "salt": "NaCl", "growth": "positive", "tested relation": "growth", "concentration": "10 %"},
         {"@ref": 2, "salt": "NaCl", "growth": "no", "tested relation": "growth", "concentration": "10 %"}]))
     assert r["growth_nacl_max_pct"] is None and r["growth_nacl_conflict"] is True
+
+
+def test_scan_range_resumes_from_block_marks(tmp_path):
+    s = FakeSession([
+        FakeResp(200, {"count": 2, "next": None, "results": {"1": rec(), "3": rec()}}),  # IDs 1-3
+        FakeResp(200, {"count": 0, "next": None, "results": {}}),                       # IDs 4-5
+    ])
+    c = BacDiveClient(cache_dir=tmp_path, session=s, backoff=0, pause=0)
+    assert [i for i, _ in c.scan_range(1, 5, block=3)] == [1, 3]
+    assert (tmp_path / "_blocks" / "1_3.ids").read_text() == "1 3"
+    n = len(s.urls)
+    # second scan: served entirely from cache + block marks, no HTTP calls
+    assert [i for i, _ in c.scan_range(1, 5, block=3)] == [1, 3] and len(s.urls) == n
+
+
+def _gtdb_file(tmp_path):
+    p = tmp_path / "bac120_metadata_test.tsv"
+    p.write_text(
+        "accession\tgtdb_representative\tgtdb_taxonomy\tcheckm2_completeness\tcheckm2_contamination\tncbi_genbank_assembly_accession\n"
+        "RS_GCF_000000010.1\tt\td__Bacteria;p__Bacillota;c__C;o__O;f__F;g__Testus;s__Testus alpha\t99\t1\tGCA_000000010.1\n"
+        "GB_GCA_000000020.1\tf\td__Bacteria;p__Bacillota;c__C;o__O;f__F;g__Testus;s__Testus alpha\t97\t2\tGCA_000000020.1\n"
+        "GB_GCA_000000030.1\tt\td__Bacteria;p__Bacteroidota;c__C;o__O;f__F;g__Other;s__Other beta\t98\t0\tGCA_000000030.1\n")
+    return p
+
+
+def test_acc_key():
+    assert acc_key("RS_GCF_000511385.1") == acc_key("GCA_000511385") == "000511385"
+
+
+def test_gtdb_reps_only_and_label_merge(tmp_path):
+    g = load_gtdb(_gtdb_file(tmp_path))
+    assert g.loc["000000010", "gtdb_phylum"] == "Bacillota" and bool(g.loc["000000010", "gtdb_representative"])
+    recs = [
+        # strain with a non-rep primary genome but a rep among its accessions -> rep chosen
+        (1, rec(genomes=[{"INSDC accession": "GCA_000000020", "score": 99},
+                         {"INSDC accession": "GCA_000000010", "score": 50}],
+                oxygen={"@ref": 1, "oxygen tolerance": "anaerobe"})),
+        # second strain on the same rep genome with a different label -> conflict, not vote
+        (2, rec(genomes=[{"INSDC accession": "GCA_000000010", "score": 90}],
+                oxygen={"@ref": 2, "oxygen tolerance": "aerobe"})),
+        (3, rec(genomes=[{"INSDC accession": "GCA_000000020", "score": 90}], species="Testus gamma",
+                oxygen={"@ref": 3, "oxygen tolerance": "aerobe"})),      # non-rep only -> dropped
+        (4, rec(genomes=[{"INSDC accession": "GCA_000000030", "score": 90}], species="Other beta",
+                oxygen={"@ref": 4, "oxygen tolerance": "aerobe"})),
+    ]
+    ref = build_reference(recs).astype(str)
+    m, dup = make_manifest(ref, gtdb=g, gtdb_reps_only=True)
+    m = m.set_index("accession")
+    assert set(m.index) == {"GCA_000000010", "GCA_000000030"}
+    assert m.loc["GCA_000000010", "oxygen"] == "" and m.loc["GCA_000000010", "oxygen_conflict"] is True
+    assert m.loc["GCA_000000030", "gtdb_phylum"] == "Bacteroidota"
+    assert m.loc["GCA_000000030", "oxygen"] == "aerobe"

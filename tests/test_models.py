@@ -132,6 +132,20 @@ def test_train_and_predict_heads():
     assert (pred["oxygen_prob_facultative"] == 0).all()  # class never seen in training
 
 
+def test_class_filter_and_per_phylum_report():
+    X, m = toy()
+    m["phylum"] = ["P1" if g in ("G0", "G1") else "P2" for g in m["genus"]]
+    m.loc[0, "oxygen"] = "facultative"
+    bundle, rep = train_heads(X, m, "test", class_filter={"oxygen": ["anaerobe", "aerobe"]},
+                              report_by="phylum")
+    ox = rep["tasks"]["oxygen"]
+    assert ox["n_labeled"] == len(m) - 1 and set(ox["classes"]) == {"anaerobe", "aerobe"}
+    assert set(ox["validation"]["by_phylum"]) == {"P1", "P2"}
+    assert "_oof" not in ox["validation"]
+    pred = predict_heads(bundle, X)
+    assert "oxygen_prob_facultative" not in pred.columns
+
+
 def test_train_requires_data():
     X, m = toy(n_per=1, genera=4)
     with pytest.raises(RuntimeError, match="no phenotype task"):

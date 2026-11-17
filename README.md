@@ -136,6 +136,23 @@ cp slurm/config.example.sh slurm/config.sh      # set MSS_ENV to your env prefix
   runs MSS-Raw as an array (one sample per task) and merges the results into one table.
 * `sbatch slurm/demo_and_tests.sbatch` runs the synthetic demo and the tests on a compute node.
 
+**Genome selection (default in `run_pipeline.sh`), following OxyMetaG.** The OxyMetaG authors
+(Bueno de Mesquita, Stallard-Olivera & Fierer 2026; code in `cliffbueno/Oxygen`,
+`code/BacDive.R`) matched BacDive genome accessions to GTDB r226 and kept only **GTDB species
+representatives**, one genome per GTDB species cluster. MSS does the same:
+- `mss genome-manifest --gtdb-metadata bac120_metadata_r226.tsv.gz ar53_metadata_r226.tsv.gz --gtdb-reps-only`
+- only strains with at least one measured label are kept (`--require-label`);
+- if any of a strain's BacDive accessions is the GTDB representative, that genome is used;
+- several BacDive strains on one genome have their labels merged without voting
+  (disagreement → conflict);
+- GTDB taxonomy and CheckM2 columns are added;
+- validation holds out GTDB genera (`--cv-group gtdb_genus`), and the report gives
+  out-of-fold accuracy per GTDB phylum (`--report-by gtdb_phylum`).
+
+OxyMetaG trained only on clear aerobes and anaerobes. MSS keeps all five classes by default and
+also trains that clear-label head (`--oxygen-classes anaerobe aerobe`, written to `models_clear/`).
+MSS does not use OxyMetaG's random 80:20 split: holding out whole genera is the stricter test.
+
 **When is a GPU used?** No MSS V1 step needs one: k-mer counting, logistic regression and
 Ridge all run on CPU. Request `--gpu` only for an external foundation-model embedding job.
 `run_pipeline.sh --embed-cmd "<cmd>" --embed-out emb.tsv` submits that job to a GPU node and

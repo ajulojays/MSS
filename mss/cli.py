@@ -109,15 +109,28 @@ def cmd_bacdive(a):
     if a.taxa_file:
         _need_file(a.taxa_file)
         names += [l.strip() for l in Path(a.taxa_file).read_text().splitlines() if l.strip() and not l.startswith("#")]
-    if not ids and not names:
-        _die("give --ids, --ids-file, --taxon or --taxa-file")
+    if not ids and not names and not a.id_range:
+        _die("give --ids, --ids-file, --taxon, --taxa-file or --id-range")
     omap = load_oxygen_map(a.oxygen_map)
     client = BacDiveClient(cache_dir=a.cache_dir)
     for n in names:
         found = client.search_name(n)
         log.info("taxon %r -> %d BacDive IDs", n, len(found))
         ids += found
-    ref = build_reference(client.fetch(ids), omap)
+    import itertools
+    streams = [client.fetch(ids)] if ids else []
+    if a.id_range:
+        lo, hi = a.id_range
+        log.info("scanning BacDive IDs %d-%d (resumable via %s/_blocks)", lo, hi, a.cache_dir)
+        streams.append(client.scan_range(lo, hi))
+    seen: set[int] = set()
+
+    def unique(it):
+        for i, r in it:
+            if i not in seen:
+                seen.add(i)
+                yield i, r
+    ref = build_reference(unique(itertools.chain(*streams)), omap)
     _write_tsv(ref, a.out)
     summ = summarize_reference(ref)
     _write_json(summ, Path(a.out).with_suffix(".summary.json"))
@@ -127,11 +140,18 @@ def cmd_bacdive(a):
 
 
 def cmd_genome_manifest(a):
-    from .genomes import make_manifest
+    from .genomes import load_gtdb, make_manifest
 
     _need_file(a.reference, "reference")
     ref = pd.read_csv(a.reference, sep="\t", dtype=str, keep_default_na=False)
-    m, dup = make_manifest(ref, a.genome_dir)
+    gtdb = None
+    if a.gtdb_metadata:
+        for f in a.gtdb_metadata:
+            _need_file(f, "GTDB metadata")
+        gtdb = load_gtdb(a.gtdb_metadata)
+    elif a.gtdb_reps_only:
+        _die("--gtdb-reps-only needs --gtdb-metadata")
+    m, dup = make_manifest(ref, a.genome_dir, a.require_label, gtdb, a.gtdb_reps_only)
     if m.empty:
         _die("no reference rows have a genome accession")
     _write_tsv(m, a.out)
@@ -169,7 +189,11 @@ def cmd_train(a):
 
     m = _read_manifest(a.manifest)
     X, ftype, _ = _features_for(m, a)
-    bundle, report = train_heads(X, m, ftype, tasks=a.tasks, cv_group=a.cv_group, seed=a.seed)
+    cf = {"oxygen": a.oxygen_classes} if a.oxygen_classes else None
+    if a.cv_group not in m.columns:
+        _die(f"--cv-group column {a.cv_group!r} not in manifest")
+    bundle, report = train_heads(X, m, ftype, tasks=a.tasks, cv_group=a.cv_group, seed=a.seed,
+                                 class_filter=cf, report_by=a.report_by)
     bundle["k"] = a.k
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -315,6 +339,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ids-file", help="file with BacDive IDs (whitespace separated)")
     p.add_argument("--taxon", nargs="+", help="taxon names, e.g. 'Bacteroides fragilis' or 'Clostridium'")
     p.add_argument("--taxa-file", help="file with one taxon name per line")
+    p.add_argument("--id-range", type=int, nargs=2, metavar=("START", "END"),
+                   help="scan every BacDive ID in this range, e.g. 1 180000 for all of BacDive "
+                        "(resumable; IDs that do not exist are skipped)")
     p.add_argument("--cache-dir", default="data/bacdive_cache", help="raw JSON cache (default data/bacdive_cache)")
     p.add_argument("--oxygen-map", help="TSV raw<TAB>category to extend/override oxygen string mapping")
     p.add_argument("--out", default="data/bacdive_reference.tsv")
@@ -323,6 +350,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("genome-manifest", help=f"{OFFLINE} reference TSV -> genome download manifest")
     p.add_argument("--reference", required=True)
     p.add_argument("--genome-dir", default="genomes")
+    p.add_argument("--require-label", nargs="+", metavar="TRAIT",
+                   help="keep only strains with a measured value for at least one of these traits, "
+                        "e.g. oxygen gram_stain motility sporulation cell_shape")
+    p.add_argument("--gtdb-metadata", nargs="+", metavar="TSV",
+                   help="GTDB metadata, e.g. bac120_metadata_r226.tsv.gz ar53_metadata_r226.tsv.gz "
+                        "(adds GTDB taxonomy, representative flag, CheckM2)")
+    p.add_argument("--gtdb-reps-only", action="store_true",
+                   help="keep only GTDB species-representative genomes (OxyMetaG strategy)")
     p.add_argument("--out", default="data/genome_manifest.tsv")
     p.set_defaults(func=cmd_genome_manifest)
 
@@ -348,7 +383,14 @@ def build_parser() -> argparse.ArgumentParser:
                    default=["oxygen", "motility", "sporulation", "gram_stain", "cell_shape"],
                    choices=["oxygen", "motility", "sporulation", "gram_stain", "cell_shape", "ph_range"],
                    help="phenotype heads to train (tasks without enough labels are skipped)")
-    p.add_argument("--cv-group", default="genus", help="manifest column for leave-group-out CV (genus/family)")
+    p.add_argument("--cv-group", default="genus",
+                   help="manifest column for leave-group-out CV, e.g. genus, family, gtdb_genus, gtdb_family")
+    p.add_argument("--report-by", default=None,
+                   help="manifest column for per-stratum CV accuracy, e.g. gtdb_phylum")
+    p.add_argument("--oxygen-classes", nargs="+", choices=["anaerobe", "facultative", "aerobe",
+                   "microaerophile", "aerotolerant"],
+                   help="train the oxygen head on these classes only, e.g. 'anaerobe aerobe' for an "
+                        "OxyMetaG-style clear-label head (default: all classes)")
     p.add_argument("--seed", type=int, default=0)
     _add_feature_args(p)
     p.set_defaults(func=cmd_train)

@@ -26,26 +26,126 @@ MANIFEST_COLUMNS = [
     "cell_shape", "cell_shape_conflict", "ph_range", "ph_range_conflict",
     "type_strain", "strain_designation",
 ]
+LABEL_TRAITS = ["oxygen", "motility", "sporulation", "gram_stain", "cell_shape", "ph_range"]
+GTDB_RANKS = ["domain", "phylum", "class", "order", "family", "genus", "species"]
+GTDB_COLUMNS = ["gtdb_accession", "gtdb_representative", "gtdb_taxonomy"] + \
+    [f"gtdb_{r}" for r in GTDB_RANKS] + ["checkm2_completeness", "checkm2_contamination"]
 
 
-def make_manifest(reference: pd.DataFrame, genome_dir: str = "genomes") -> tuple[pd.DataFrame, pd.DataFrame]:
-    """One row per unique primary genome accession; returns (manifest, duplicate log)."""
+def acc_key(acc: str) -> str:
+    """'GCA_000511385.1' / 'GCF_000511385' / 'GB_GCA_000511385.1' -> '000511385' (assembly number)."""
+    a = str(acc).strip()
+    for pre in ("RS_", "GB_"):
+        if a.startswith(pre):
+            a = a[3:]
+    a = a.split(".")[0]
+    return a[4:] if a[:4] in ("GCA_", "GCF_") else a
+
+
+def load_gtdb(paths) -> pd.DataFrame:
+    """GTDB metadata TSV(s) (e.g. bac120_metadata_r226.tsv.gz, ar53_metadata_r226.tsv.gz),
+    indexed by assembly number. Only the needed columns are read."""
+    want = ["accession", "gtdb_representative", "gtdb_taxonomy", "checkm2_completeness",
+            "checkm2_contamination", "ncbi_genbank_assembly_accession"]
+    frames = []
+    for p in ([paths] if isinstance(paths, (str, Path)) else paths):
+        df = pd.read_csv(p, sep="\t", usecols=lambda c: c in want, dtype=str, low_memory=False)
+        frames.append(df)
+        log.info("GTDB metadata %s: %d genomes", p, len(df))
+    g = pd.concat(frames, ignore_index=True)
+    g["key"] = [acc_key(x) for x in g["accession"]]
+    g["gtdb_representative"] = g["gtdb_representative"].str.lower().isin(["t", "true", "1"])
+    tax = g["gtdb_taxonomy"].fillna("").str.split(";", expand=True).reindex(columns=range(7)).fillna("")
+    for i, r in enumerate(GTDB_RANKS):
+        g[f"gtdb_{r}"] = tax[i].str.replace(r"^[a-z]__", "", regex=True)
+    g = g.rename(columns={"accession": "gtdb_accession"})
+    # A GenBank/RefSeq pair share one assembly number; keep the representative row first.
+    g = g.sort_values("gtdb_representative", ascending=False).drop_duplicates("key")
+    return g.set_index("key")[GTDB_COLUMNS]
+
+
+def _merge_duplicate_genomes(r: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Several BacDive strains -> one genome: merge labels without voting.
+
+    Agreeing labels are kept; disagreeing labels become empty with ``<trait>_conflict=True``.
+    """
+    dup_mask = r.duplicated("genome_accession", keep=False)
+    if not dup_mask.any():
+        return r, r.iloc[0:0]
+    dup = r[dup_mask].copy()
+    keep = r.drop_duplicates("genome_accession", keep="first").set_index("genome_accession").astype(object)
+    for acc, g in dup.groupby("genome_accession"):
+        for t in LABEL_TRAITS:
+            if t not in g.columns:
+                continue
+            vals = {str(v).strip() for v in g[t].fillna("") if str(v).strip()}
+            conf = f"{t}_conflict"
+            prior = g[conf].astype(str).str.lower().isin(["true", "1"]).any() if conf in g.columns else False
+            if len(vals) > 1 or prior:
+                keep.at[acc, t] = ""
+                if conf in keep.columns:
+                    keep.at[acc, conf] = True
+            elif len(vals) == 1:
+                keep.at[acc, t] = vals.pop()
+        keep.at[acc, "bacdive_id"] = ";".join(map(str, g["bacdive_id"]))
+    return keep.reset_index(), dup
+
+
+def make_manifest(reference: pd.DataFrame, genome_dir: str = "genomes",
+                  require_label: list[str] | None = None, gtdb: pd.DataFrame | None = None,
+                  gtdb_reps_only: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """One row per unique genome; returns (manifest, duplicate log).
+
+    require_label: keep strains with a measured value for at least one of these traits.
+    gtdb: output of :func:`load_gtdb`. When given, a strain's accession that is a GTDB species
+      representative is preferred over BacDive's primary accession, and GTDB taxonomy and
+      CheckM2 columns are added.
+    gtdb_reps_only: keep only GTDB species-representative genomes (one genome per GTDB species
+      cluster), the dereplication strategy of OxyMetaG (Bueno de Mesquita et al. 2026).
+    """
     r = reference.copy()
     r["genome_accession"] = r["genome_accession"].fillna("").astype(str)
     r = r[r["genome_accession"] != ""]
-    dup = r[r.duplicated("genome_accession", keep="first")]
-    r = r.drop_duplicates("genome_accession", keep="first")
+    if require_label:
+        has = pd.Series(False, index=r.index)
+        for t in require_label:
+            if t in r.columns:
+                has |= r[t].fillna("").astype(str).str.strip() != ""
+        log.info("%d of %d strains with a genome have a measured %s label",
+                 int(has.sum()), len(r), "/".join(require_label))
+        r = r[has].copy()
+    if gtdb is not None:
+        alls = r["all_genome_accessions"] if "all_genome_accessions" in r.columns else r["genome_accession"]
+        chosen = []
+        for primary, allacc in zip(r["genome_accession"], alls.fillna("")):
+            cands = [a for a in str(allacc).split(";") if a] or [primary]
+            reps = [a for a in cands if acc_key(a) in gtdb.index and gtdb.at[acc_key(a), "gtdb_representative"]]
+            chosen.append(reps[0] if reps else primary)
+        r["genome_accession"] = chosen
+        info = gtdb.reindex([acc_key(a) for a in r["genome_accession"]])
+        for c in GTDB_COLUMNS:
+            r[c] = info[c].to_numpy()
+        r["gtdb_representative"] = r["gtdb_representative"].fillna(False).astype(bool)
+        log.info("GTDB r226 match: %d of %d strains; %d use a GTDB species representative",
+                 int(info["gtdb_accession"].notna().sum()), len(r), int(r["gtdb_representative"].sum()))
+        if gtdb_reps_only:
+            r = r[r["gtdb_representative"]].copy()
+    elif gtdb_reps_only:
+        raise ValueError("gtdb_reps_only needs GTDB metadata")
+    r, dup = _merge_duplicate_genomes(r)
+    if len(dup):
+        log.warning("%d BacDive strains share a genome with another strain; labels merged "
+                    "(disagreements -> conflict)", len(dup))
     m = pd.DataFrame({
-        "genome_id": r["genome_accession"],
-        "accession": r["genome_accession"],
+        "genome_id": r["genome_accession"].to_numpy(),
+        "accession": r["genome_accession"].to_numpy(),
         "genome_fasta": [str(Path(genome_dir) / f"{a}.fna.gz") for a in r["genome_accession"]],
     })
-    for c in MANIFEST_COLUMNS:
+    cols = MANIFEST_COLUMNS + ([c for c in GTDB_COLUMNS] if gtdb is not None else [])
+    for c in cols:
         if c not in m.columns:
             m[c] = r[c].to_numpy() if c in r.columns else ""
-    if len(dup):
-        log.warning("%d BacDive strains share an accession with an earlier strain; kept first", len(dup))
-    return m[MANIFEST_COLUMNS].reset_index(drop=True), dup
+    return m[cols].reset_index(drop=True), dup
 
 
 def validate_fasta(path) -> tuple[bool, str, int, int]:
@@ -122,7 +222,14 @@ def download_genomes(manifest: pd.DataFrame, outdir: str | Path, batch_size: int
     for s in range(0, len(todo), batch_size):
         batch = todo[s:s + batch_size]
         log.info("downloading %d-%d of %d", s + 1, s + len(batch), len(todo))
-        errors.update(_datasets_batch(batch, outdir, datasets_bin))
+        res = _datasets_batch(batch, outdir, datasets_bin)
+        failed = [acc for acc, e in res.items() if e]
+        if len(batch) > 1 and len(failed) == len(batch):
+            # whole batch failed (e.g. one invalid accession): retry one by one
+            log.warning("batch failed (%s); retrying %d accessions individually", res[batch[0]], len(batch))
+            for acc in batch:
+                res.update(_datasets_batch([acc], outdir, datasets_bin))
+        errors.update(res)
     fails, ok_rows, seen_hash = [], [], {}
     for r in m.to_dict("records"):
         err = errors.get(r["accession"], "")

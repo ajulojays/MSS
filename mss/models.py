@@ -86,19 +86,41 @@ def group_cv(clf, X: np.ndarray, y: np.ndarray, groups: np.ndarray, seed: int) -
         "labels": labels,
         "confusion_matrix": confusion_matrix(yt, yp, labels=labels).tolist(),
         "folds": folds,
+        "_oof": oof,  # removed by train_heads before reporting
     }
 
 
 DEFAULT_TASKS = ("oxygen", "motility", "sporulation", "gram_stain", "cell_shape")
 
 
+def _per_stratum(y, oof, strata) -> dict:
+    out = {}
+    ev = np.array([o is not None for o in oof])
+    for s_ in sorted(set(strata[ev])):
+        m = ev & (strata == s_)
+        yt, yp = y[m], oof[m].astype(str)
+        out[str(s_)] = {"n": int(m.sum()), "accuracy": float((yt == yp).mean()),
+                        "balanced_accuracy": float(balanced_accuracy_score(yt, yp))
+                        if len(np.unique(yt)) > 1 else None,
+                        "classes_present": sorted(map(str, np.unique(yt)))}
+    return out
+
+
 def train_heads(X: pd.DataFrame, manifest: pd.DataFrame, feature_type: str,
                 tasks=DEFAULT_TASKS,
-                cv_group: str = "genus", seed: int = 0) -> tuple[dict, dict]:
+                cv_group: str = "genus", seed: int = 0,
+                class_filter: dict | None = None,
+                report_by: str | None = None) -> tuple[dict, dict]:
+    """class_filter: {task: [classes]} trains that head only on those classes (e.g. OxyMetaG-style
+    oxygen head on clear aerobes vs anaerobes). report_by: manifest column (e.g. gtdb_phylum) for
+    per-stratum out-of-fold accuracy."""
     heads, report = {}, {"tasks": {}}
     meta = manifest.drop_duplicates("genome_id").set_index("genome_id")
+    class_filter = class_filter or {}
     for task in tasks:
         lab = task_labels(manifest, task)
+        if task in class_filter:
+            lab = lab[lab.isin(class_filter[task])]
         lab = lab[lab.index.isin(X.index)]
         lab = lab[~lab.index.duplicated()]
         counts = {k: int(v) for k, v in lab.value_counts().items()}
@@ -118,11 +140,17 @@ def train_heads(X: pd.DataFrame, manifest: pd.DataFrame, feature_type: str,
             groups = np.where(groups == "", "unknown_" + lab.index.to_numpy(), groups)
             entry["validation"] = group_cv(clf, Xt, y, groups, seed)
             entry["validation"]["group_column"] = cv_group
+            oof = entry["validation"].pop("_oof", None)
+            if report_by and report_by in meta.columns and oof is not None:
+                strata = meta.loc[lab.index, report_by].fillna("").astype(str).to_numpy()
+                entry["validation"][f"by_{report_by}"] = _per_stratum(y, oof, strata)
         else:
             entry["validation"] = {"status": "skipped", "reason": f"no {cv_group!r} column"}
         model = clone(clf).fit(Xt, y)
         entry["status"] = "trained"
         entry["classes"] = list(map(str, model.classes_))
+        if task in class_filter:
+            entry["class_filter"] = list(class_filter[task])
         heads[task] = model
         log.info("task %s: trained on %d genomes %s; CV %s", task, len(y), counts,
                  entry["validation"].get("balanced_accuracy", entry["validation"].get("reason")))
@@ -139,7 +167,9 @@ def train_heads(X: pd.DataFrame, manifest: pd.DataFrame, feature_type: str,
         "heads": heads,
         "seed": seed,
         # fixed vocabularies keep all columns; open ones (cell_shape, ph_range) use fitted classes
-        "task_labels": {t: TASK_LABELS[t] or list(map(str, heads[t].classes_)) for t in heads},
+        "task_labels": {t: (class_filter.get(t) or TASK_LABELS[t] or list(map(str, heads[t].classes_)))
+                        for t in heads},
+        "class_filter": class_filter,
     }
     report.update({k: bundle[k] for k in ("model_id", "mss_version", "created", "feature_type", "seed")})
     report["n_features"] = X.shape[1]

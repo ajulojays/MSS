@@ -12,6 +12,7 @@ Extraction rules (see README "Evidence rules"):
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import re
@@ -132,25 +133,87 @@ class BacDiveClient:
         """Yield (bacdive_id, raw_record). Uses / fills the JSON cache."""
         todo = []
         for i in dict.fromkeys(int(x) for x in ids):
-            cached = self._cache_path(i)
-            if cached and cached.exists():
-                yield i, json.loads(cached.read_text())
+            rec = self._cache_read(i)
+            if rec is not None:
+                yield i, rec
             else:
                 todo.append(i)
         for s in range(0, len(todo), chunk):
-            block = todo[s:s + chunk]
-            url = f"{API_ROOT}/fetch/" + ";".join(map(str, block))
-            while url:
-                page = self._get(url)
-                for k, rec in (page.get("results") or {}).items():
-                    bid = int(k)
-                    if self.cache_dir:
-                        self._cache_path(bid).write_text(json.dumps(rec))
-                    yield bid, rec
-                url = page.get("next")
+            yield from self._fetch_block(todo[s:s + chunk])
+
+    def _fetch_block(self, block: list[int]) -> Iterator[tuple[int, dict]]:
+        url = f"{API_ROOT}/fetch/" + ";".join(map(str, block))
+        while url:
+            page = self._get(url)
+            for k, rec in (page.get("results") or {}).items():
+                bid = int(k)
+                self._cache_write(bid, rec)
+                yield bid, rec
+            url = page.get("next")
+
+    def scan_range(self, start: int, end: int, block: int = 100,
+                   log_every: int = 50) -> Iterator[tuple[int, dict]]:
+        """Yield every existing record with start <= ID <= end (BacDive has no list-all endpoint).
+
+        IDs are requested in blocks; absent IDs are simply not returned. With a cache, each
+        finished block is recorded (``_blocks/<first_id>.ids``), so an interrupted scan resumes
+        without re-querying finished blocks.
+        """
+        if end < start:
+            raise ValueError("id range end < start")
+        mark_dir = self.cache_dir / "_blocks" if self.cache_dir else None
+        if mark_dir:
+            mark_dir.mkdir(exist_ok=True)
+        n_blocks = (end - start) // block + 1
+        found = 0
+        for b, s in enumerate(range(start, end + 1, block)):
+            ids = list(range(s, min(s + block, end + 1)))
+            mark = mark_dir / f"{s}_{ids[-1]}.ids" if mark_dir else None
+            if mark and mark.exists():
+                got = [int(x) for x in mark.read_text().split()]
+                for i in got:
+                    rec = self._cache_read(i)
+                    if rec is None:  # cache file lost: refetch this block
+                        break
+                else:
+                    for i in got:
+                        yield i, self._cache_read(i)
+                    found += len(got)
+                    continue
+            got = []
+            for i, rec in self._fetch_block(ids):
+                got.append(i)
+                yield i, rec
+            found += len(got)
+            if mark:
+                mark.write_text(" ".join(map(str, sorted(got))))
+            if (b + 1) % log_every == 0 or b + 1 == n_blocks:
+                log.info("scanned block %d/%d (IDs up to %d): %d records so far",
+                         b + 1, n_blocks, ids[-1], found)
 
     def _cache_path(self, bid: int) -> Path | None:
-        return self.cache_dir / f"{bid}.json" if self.cache_dir else None
+        return self.cache_dir / f"{bid}.json.gz" if self.cache_dir else None
+
+    def _cache_read(self, bid: int) -> dict | None:
+        if not self.cache_dir:
+            return None
+        gz = self.cache_dir / f"{bid}.json.gz"
+        if gz.exists():
+            with gzip.open(gz, "rt") as fh:
+                return json.load(fh)
+        plain = self.cache_dir / f"{bid}.json"  # older uncompressed cache
+        if plain.exists():
+            return json.loads(plain.read_text())
+        return None
+
+    def _cache_write(self, bid: int, rec: dict) -> None:
+        if not self.cache_dir:
+            return
+        p = self._cache_path(bid)
+        tmp = p.with_suffix(".tmp")
+        with gzip.open(tmp, "wt") as fh:
+            json.dump(rec, fh)
+        tmp.replace(p)
 
 
 # --------------------------------------------------------------------------------------
