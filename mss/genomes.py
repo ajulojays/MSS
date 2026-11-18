@@ -178,7 +178,8 @@ def sha256(path, block=1 << 20) -> str:
 def _datasets_batch(accessions: list[str], outdir: Path, datasets_bin: str) -> dict[str, str]:
     """Download one batch; returns {accession: error or ''}."""
     res = {a: "not returned by NCBI Datasets" for a in accessions}
-    with tempfile.TemporaryDirectory(dir=outdir) as td:
+    # ignore_cleanup_errors: on NFS a just-deleted file can briefly keep the dir non-empty
+    with tempfile.TemporaryDirectory(dir=outdir, ignore_cleanup_errors=True) as td:
         td = Path(td)
         acc_file = td / "acc.txt"
         acc_file.write_text("\n".join(accessions) + "\n")
@@ -208,14 +209,22 @@ def _datasets_batch(accessions: list[str], outdir: Path, datasets_bin: str) -> d
     return res
 
 
+def _safe_batch(accessions: list[str], outdir: Path, datasets_bin: str) -> dict[str, str]:
+    """_datasets_batch, but an unexpected error is recorded per accession instead of raised."""
+    try:
+        return _datasets_batch(accessions, outdir, datasets_bin)
+    except Exception as exc:  # noqa: BLE001 - one bad batch must not abort the whole download
+        return {a: f"{type(exc).__name__}: {exc}" for a in accessions}
+
+
 def _fetch_batch(batch: list[str], outdir: Path, datasets_bin: str) -> dict[str, str]:
-    res = _datasets_batch(batch, outdir, datasets_bin)
+    res = _safe_batch(batch, outdir, datasets_bin)
     failed = [acc for acc, e in res.items() if e]
     if len(batch) > 1 and len(failed) == len(batch):
         # whole batch failed (e.g. one invalid accession or a transient error): retry one by one
         log.warning("batch failed (%s); retrying %d accessions individually", res[batch[0]], len(batch))
         for acc in batch:
-            res.update(_datasets_batch([acc], outdir, datasets_bin))
+            res.update(_safe_batch([acc], outdir, datasets_bin))
     return res
 
 
