@@ -217,6 +217,39 @@ def cmd_pfam_table(a):
     log.info("Pfam table: %d genomes x %d Pfams (%s)", len(X), X.shape[1] - 1, a.value)
 
 
+def cmd_bacdive_tests(a):
+    from .bacdive_tests import tests_from_cache
+
+    src = pd.read_csv(a.ids_from, sep="\t", dtype=str, keep_default_na=False)
+    if "bacdive_id" not in src.columns:
+        _die(f"{a.ids_from}: needs a bacdive_id column")
+    ids = sorted({int(x) for x in src.bacdive_id if str(x).strip().isdigit()})
+    t, missing = tests_from_cache(a.cache_dir, ids, threads=a.threads)
+    if missing:
+        log.warning("%d BacDive ids have no readable cached record (e.g. %s)", len(missing), missing[:3])
+    _write_tsv(t, a.out)
+    s = t.groupby("section").agg(rows=("bacdive_id", "size"), strains=("bacdive_id", "nunique"),
+                                 items=("item", "nunique"))
+    log.info("BacDive tests for %d strains:\n%s", len(ids) - len(missing), s.to_string())
+
+
+def cmd_trait_labels(a):
+    from .bacdive_tests import trait_labels
+
+    t = pd.read_csv(a.tests, sep="\t", dtype=str, keep_default_na=False)
+    t["bacdive_id"] = t.bacdive_id.astype(int)
+    m = pd.read_csv(a.manifest, sep="\t", dtype=str, keep_default_na=False)
+    if "bacdive_id" not in m.columns:
+        _die(f"{a.manifest}: needs a bacdive_id column")
+    ids = [int(x) for x in m.bacdive_id if str(x).strip().isdigit()]
+    lab, cat = trait_labels(t, ids, min_class=a.min_class, sections=a.sections)
+    _write_tsv(lab, a.out)
+    _write_tsv(cat, Path(a.out).with_suffix("").with_suffix(".catalogue.tsv"))
+    kept = cat[cat.status == "kept"] if len(cat) else cat
+    log.info("%d traits kept of %d tested (classes with >= %d genomes):\n%s", len(kept), len(cat), a.min_class,
+             kept.groupby("section").size().to_string() if len(kept) else "none")
+
+
 def cmd_features(a):
     m = _read_manifest(a.manifest)
     X, ftype, stats = _features_for(m, a)
@@ -233,6 +266,24 @@ def cmd_train(a):
     from .models import task_labels, train_heads
 
     m = _read_manifest(a.manifest)
+    if a.extra_labels:
+        _need_file(a.extra_labels, "extra label table")
+        ex = pd.read_csv(a.extra_labels, sep="\t", dtype=str, keep_default_na=False)
+        if "bacdive_id" not in ex.columns or "bacdive_id" not in m.columns:
+            _die("--extra-labels and the manifest both need a bacdive_id column")
+        extra_traits = [c for c in ex.columns if c != "bacdive_id" and not c.endswith("_conflict")]
+        clash = [c for c in ex.columns if c != "bacdive_id" and c in m.columns]
+        if clash:
+            _die(f"--extra-labels columns already in the manifest: {clash[:5]}")
+        m = m.merge(ex, on="bacdive_id", how="left").fillna("")
+        log.info("extra labels: %d traits from %s", len(extra_traits), a.extra_labels)
+        if a.tasks == ["extra"]:
+            a.tasks = extra_traits
+    elif a.tasks == ["extra"]:
+        _die("--tasks extra needs --extra-labels")
+    unknown = [t for t in a.tasks if t not in m.columns]
+    if unknown:
+        _die(f"--tasks not found as manifest or --extra-labels columns: {unknown[:5]}")
     cf = {}
     for spec in a.class_filter or []:
         task, sep, classes = spec.partition("=")
@@ -454,6 +505,25 @@ def build_parser() -> argparse.ArgumentParser:
                                                                  "are not annotated yet")
     p.set_defaults(func=cmd_pfam_table)
 
+    p = sub.add_parser("bacdive-tests", help=f"{OFFLINE} metabolite utilization, enzymes, metabolite production "
+                                             "and halophily from cached BacDive records")
+    p.add_argument("--ids-from", required=True, help="table with a bacdive_id column (reference or manifest)")
+    p.add_argument("--cache-dir", default="data/bacdive_cache", help="BacDive record cache from `mss bacdive`")
+    p.add_argument("--out", required=True, help="long table (.tsv or .tsv.gz), one row per strain x test entry")
+    p.add_argument("--threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)))
+    p.set_defaults(func=cmd_bacdive_tests)
+
+    p = sub.add_parser("trait-labels", help=f"{OFFLINE} one trait per BacDive test, for `train --extra-labels`")
+    p.add_argument("--tests", required=True, help="output of `mss bacdive-tests`")
+    p.add_argument("--manifest", required=True, help="genomes to label (bacdive_id column), e.g. labeled_genomes.tsv")
+    p.add_argument("--out", required=True)
+    p.add_argument("--min-class", type=int, default=50,
+                   help="a class needs at least this many genomes to be kept; smaller classes are left out, "
+                        "not merged; traits left with < 2 classes are dropped (default 50)")
+    p.add_argument("--sections", nargs="+", choices=["metabolite_utilization", "enzymes",
+                                                     "metabolite_production", "halophily"])
+    p.set_defaults(func=cmd_trait_labels)
+
     p = sub.add_parser("features", help=f"{OFFLINE} precompute/cache genome k-mer features")
     p.add_argument("--manifest", required=True)
     p.add_argument("--out", required=True, help="feature table (.tsv or .tsv.gz)")
@@ -465,8 +535,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--tasks", nargs="+",
                    default=["oxygen", "motility", "sporulation", "gram_stain", "cell_shape"],
-                   choices=["oxygen", "motility", "sporulation", "gram_stain", "cell_shape", "ph_range"],
-                   help="phenotype heads to train (tasks without enough labels are skipped)")
+                   help="phenotype heads to train: oxygen, motility, sporulation, gram_stain, cell_shape, ph_range, "
+                        "any --extra-labels column, or 'extra' for every --extra-labels trait "
+                        "(tasks without enough labels are skipped)")
+    p.add_argument("--extra-labels", help="trait label table from `mss trait-labels` (bacdive_id + one column per "
+                                           "trait), joined to the manifest on bacdive_id")
     p.add_argument("--cv-group", default="genus",
                    help="manifest column for leave-group-out CV, e.g. genus, family, gtdb_genus, gtdb_family")
     p.add_argument("--report-by", default=None,

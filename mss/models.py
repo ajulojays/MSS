@@ -167,7 +167,7 @@ def train_heads(X: pd.DataFrame, manifest: pd.DataFrame, feature_type: str,
         "heads": heads,
         "seed": seed,
         # fixed vocabularies keep all columns; open ones (cell_shape, ph_range) use fitted classes
-        "task_labels": {t: (class_filter.get(t) or TASK_LABELS[t] or list(map(str, heads[t].classes_)))
+        "task_labels": {t: (class_filter.get(t) or TASK_LABELS.get(t) or list(map(str, heads[t].classes_)))
                         for t in heads},
         "class_filter": class_filter,
     }
