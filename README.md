@@ -151,6 +151,9 @@ representatives**, one genome per GTDB species cluster. MSS does the same:
 
 OxyMetaG trained only on clear aerobes and anaerobes. MSS keeps all five classes by default and
 also trains that clear-label head (`--oxygen-classes anaerobe aerobe`, written to `models_clear/`).
+The main `train` step also restricts two heads to their clear classes with `--class-filter`:
+Gram stain to negative vs positive (BacDive "variable" is left out) and cell shape to
+rod-shaped vs coccus-shaped (other BacDive shape labels are left out, not merged).
 MSS does not use OxyMetaG's random 80:20 split: holding out whole genera is the stricter test.
 
 **When is a GPU used?** No MSS V1 step needs one: k-mer counting, logistic regression and

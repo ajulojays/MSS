@@ -60,11 +60,24 @@ def _features_for(manifest, args, feature_type=None):
     from .features import genome_kmer_table, load_embeddings
 
     emb = getattr(args, "embeddings", None)
+    if isinstance(emb, str):
+        emb = [emb]
     if emb or (feature_type and feature_type.startswith("embedding")):
         if not emb:
             _die("this model was trained on external embeddings; pass --embeddings")
-        _need_file(emb, "embeddings")
-        X = load_embeddings(emb, args.embedding_key)
+        tables = []
+        for path in emb:
+            _need_file(path, "embeddings")
+            tables.append(load_embeddings(path, args.embedding_key))
+        X = tables[0]
+        for path, T in zip(emb[1:], tables[1:]):
+            clash = X.columns.intersection(T.columns)
+            if len(clash):
+                _die(f"{path}: feature columns already in an earlier table (e.g. {list(clash[:3])})")
+            n0 = len(X)
+            X = X.join(T, how="inner")
+            log.info("joined %s: %d features; %d genomes in both (%d and %d before)",
+                     Path(path).name, X.shape[1], len(X), n0, len(T))
         if args.embedding_key not in manifest.columns:
             _die(f"manifest has no column {args.embedding_key!r} to match embeddings")
         key_to_gid = dict(zip(manifest[args.embedding_key].astype(str), manifest["genome_id"]))
@@ -74,7 +87,7 @@ def _features_for(manifest, args, feature_type=None):
                         len(missing), missing[:3])
         X = X.loc[[k for k in key_to_gid if k in X.index]]
         X.index = pd.Index([key_to_gid[k] for k in X.index], name="genome_id")
-        return X, f"embedding:{Path(emb).name}", pd.DataFrame()
+        return X, "embedding:" + "+".join(Path(p).name for p in emb), pd.DataFrame()
     t0 = time.time()
     X, stats = genome_kmer_table(manifest, k=args.k, cache_dir=args.cache_dir, threads=args.threads)
     bad = stats[stats["error"] != ""]
@@ -90,8 +103,10 @@ def _add_feature_args(p):
                    help="per-genome k-mer cache directory (default .mss_cache/kmers)")
     p.add_argument("--threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)),
                    help="worker processes (default $SLURM_CPUS_PER_TASK or 1)")
-    p.add_argument("--embeddings", help="optional precomputed embedding TSV (dna_*/protein_*/f_* columns) "
-                                        "used INSTEAD of k-mers")
+    p.add_argument("--embeddings", nargs="+",
+                   help="one or more precomputed feature TSVs (genome key + dna_*/protein_*/f_*/kmer_* columns), "
+                        "used INSTEAD of on-the-fly k-mers; several are joined on the key (genomes in all of them), "
+                        "e.g. features/kmer5.tsv.gz features/pfam_pa.tsv.gz for a k-mer + Pfam hybrid")
     p.add_argument("--embedding-key", default="genome_id",
                    help="manifest column matching the embedding key column (default genome_id)")
 
@@ -173,6 +188,35 @@ def cmd_download_genomes(a):
     log.info("%d genomes ready, %d failed", len(ok), len(fails))
 
 
+def cmd_pfam_annotate(a):
+    from .pfam import annotate_genomes
+
+    _need_file(a.hmm, "Pfam HMM file")
+    m = _read_manifest(a.manifest)
+    tid = a.task_id if a.task_id is not None else int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+    n = a.n_tasks if a.n_tasks is not None else int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1))
+    if not 0 <= tid < n:
+        _die(f"task id {tid} outside 0..{n - 1}")
+    res = annotate_genomes(m, a.hmm, a.cache_dir, cpus=a.threads, task_id=tid, n_tasks=n, batch=a.batch)
+    log.info("pfam-annotate: %s", res)
+
+
+def cmd_pfam_table(a):
+    from .pfam import pfam_table
+
+    m = _read_manifest(a.manifest)
+    X, stats = pfam_table(m, a.cache_dir, value=a.value, min_genomes=a.min_genomes)
+    _write_tsv(stats, Path(a.out).with_suffix("").with_suffix(".stats.tsv"))
+    bad = stats[stats.error != ""]
+    if len(bad):
+        log.warning("%d genomes left out (%s)", len(bad), bad.error.value_counts().to_dict())
+    if (bad.error == "not annotated").any() and not a.allow_missing:
+        _die(f"{(bad.error == 'not annotated').sum()} genomes are not annotated yet; finish pfam-annotate "
+             "or pass --allow-missing")
+    _write_tsv(X, a.out)
+    log.info("Pfam table: %d genomes x %d Pfams (%s)", len(X), X.shape[1] - 1, a.value)
+
+
 def cmd_features(a):
     m = _read_manifest(a.manifest)
     X, ftype, stats = _features_for(m, a)
@@ -186,13 +230,30 @@ def cmd_features(a):
 def cmd_train(a):
     import joblib
 
-    from .models import train_heads
+    from .models import task_labels, train_heads
 
     m = _read_manifest(a.manifest)
-    X, ftype, _ = _features_for(m, a)
-    cf = {"oxygen": a.oxygen_classes} if a.oxygen_classes else None
+    cf = {}
+    for spec in a.class_filter or []:
+        task, sep, classes = spec.partition("=")
+        names = [c.strip() for c in classes.split(",") if c.strip()]
+        if not sep or not names:
+            _die(f"--class-filter {spec!r}: expected TASK=CLASS,CLASS (e.g. gram_stain=negative,positive)")
+        if task not in a.tasks:
+            _die(f"--class-filter task {task!r} is not in --tasks {a.tasks}")
+        cf[task] = names
+    if a.oxygen_classes:
+        if "oxygen" in cf:
+            _die("give the oxygen filter once: --oxygen-classes or --class-filter oxygen=...")
+        cf["oxygen"] = a.oxygen_classes
+    for task, names in cf.items():
+        unknown = [n for n in names if n not in set(task_labels(m, task))]
+        if unknown:
+            _die(f"--class-filter {task}: {unknown} not found among the manifest's {task} labels")
+    cf = cf or None
     if a.cv_group not in m.columns:
         _die(f"--cv-group column {a.cv_group!r} not in manifest")
+    X, ftype, _ = _features_for(m, a)
     bundle, report = train_heads(X, m, ftype, tasks=a.tasks, cv_group=a.cv_group, seed=a.seed,
                                  class_filter=cf, report_by=a.report_by)
     bundle["k"] = a.k
@@ -372,6 +433,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=8, help="concurrent NCBI Datasets batch downloads")
     p.set_defaults(func=cmd_download_genomes)
 
+    p = sub.add_parser("pfam-annotate", help=f"{OFFLINE} gene calls + Pfam (GA cutoffs) per genome, cached; "
+                                             "splits across a SLURM array")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--hmm", required=True, help="Pfam-A.hmm or Pfam-A.hmm.gz")
+    p.add_argument("--cache-dir", default=".mss_cache/pfam")
+    p.add_argument("--threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)))
+    p.add_argument("--task-id", type=int, help="this task's index (default $SLURM_ARRAY_TASK_ID or 0)")
+    p.add_argument("--n-tasks", type=int, help="number of tasks (default $SLURM_ARRAY_TASK_COUNT or 1)")
+    p.add_argument("--batch", type=int, default=20, help="genomes searched together per hmmsearch call")
+    p.set_defaults(func=cmd_pfam_annotate)
+
+    p = sub.add_parser("pfam-table", help=f"{OFFLINE} join Pfam caches into a genome x Pfam feature table")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--cache-dir", default=".mss_cache/pfam")
+    p.add_argument("--out", required=True, help="feature table (.tsv or .tsv.gz), usable as --embeddings")
+    p.add_argument("--value", choices=["presence", "count"], default="presence")
+    p.add_argument("--min-genomes", type=int, default=1, help="keep Pfams found in at least this many genomes")
+    p.add_argument("--allow-missing", action="store_true", help="write the table even if some genomes "
+                                                                 "are not annotated yet")
+    p.set_defaults(func=cmd_pfam_table)
+
     p = sub.add_parser("features", help=f"{OFFLINE} precompute/cache genome k-mer features")
     p.add_argument("--manifest", required=True)
     p.add_argument("--out", required=True, help="feature table (.tsv or .tsv.gz)")
@@ -393,6 +475,9 @@ def build_parser() -> argparse.ArgumentParser:
                    "microaerophile", "aerotolerant"],
                    help="train the oxygen head on these classes only, e.g. 'anaerobe aerobe' for an "
                         "OxyMetaG-style clear-label head (default: all classes)")
+    p.add_argument("--class-filter", action="append", metavar="TASK=CLASS,CLASS",
+                   help="train TASK only on genomes whose label is one of these classes; other labels are "
+                        "left out, not merged (repeatable), e.g. gram_stain=negative,positive")
     p.add_argument("--seed", type=int, default=0)
     _add_feature_args(p)
     p.set_defaults(func=cmd_train)

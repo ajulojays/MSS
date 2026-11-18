@@ -282,6 +282,20 @@ def test_demo_end_to_end(tmp_path, monkeypatch):
     assert np.allclose(tp[fr + ["unresolved_pct"]].sum(axis=1), 100)
     r = pd.read_csv("res/raw.tsv", sep="\t")
     assert r.loc[0, "n_reads"] == 2000
+
+    # --class-filter: train a head on two of its classes only; bad specs fail before features load
+    import json
+    g = pd.read_csv(f"{d}/genomes.tsv", sep="\t")
+    two = sorted(g["oxygen"].dropna().astype(str).value_counts().index[:2])
+    main(["train", "--manifest", f"{d}/genomes.tsv", "--out", "models_cf", "--tasks", "oxygen",
+          "--class-filter", f"oxygen={','.join(two)}"])
+    rep = json.load(open("models_cf/training_report.json"))["tasks"]["oxygen"]
+    assert rep["class_filter"] == two and set(rep["class_counts"]) == set(two)
+    for bad in (["--tasks", "motility", "--class-filter", f"oxygen={two[0]}"],
+                ["--tasks", "oxygen", "--class-filter", "oxygen=not_a_label"],
+                ["--tasks", "oxygen", "--class-filter", "oxygen"]):
+        with pytest.raises(SystemExit):
+            main(["train", "--manifest", f"{d}/genomes.tsv", "--out", "models_bad", *bad])
     assert r.loc[0, "status"] == "EXPERIMENTAL_UNVALIDATED"
     assert np.isclose(r[fr].sum(axis=1).iloc[0], 100)
     w = pd.read_csv("res/taxa.traits.tsv", sep="\t")

@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+pfam = ["pyrodigal>=3.0", "pyhmmer>=0.11"]
 
 [project.scripts]
 mss = "mss.cli:main"

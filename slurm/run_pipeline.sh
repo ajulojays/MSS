@@ -61,7 +61,7 @@ if [[ -n "$EMBED_CMD" ]]; then
   FEAT=(--embeddings "$EMBED_OUT"); TRAIN_AFTER="$j4b"
   echo "embedding (GPU) job $j4b"
 fi
-j5=$($S --name mss_train --cpus "$THREADS" --mem 32G --time 12:00:00 --after "$TRAIN_AFTER" -- train --manifest data/labeled_genomes.tsv --out models "${FEAT[@]}" --threads "$THREADS" --cv-group gtdb_genus --report-by gtdb_phylum)
+j5=$($S --name mss_train --cpus "$THREADS" --mem 32G --time 12:00:00 --after "$TRAIN_AFTER" -- train --manifest data/labeled_genomes.tsv --out models "${FEAT[@]}" --threads "$THREADS" --cv-group gtdb_genus --report-by gtdb_phylum --class-filter gram_stain=negative,positive --class-filter cell_shape=rod-shaped,coccus-shaped)
 j5b=$($S --name mss_train_clear --cpus "$THREADS" --mem 32G --time 12:00:00 --after "$TRAIN_AFTER" -- train --manifest data/labeled_genomes.tsv --out models_clear "${FEAT[@]}" --threads "$THREADS" --cv-group gtdb_genus --report-by gtdb_phylum --tasks oxygen --oxygen-classes anaerobe aerobe)
 j6=$($S --name mss_predict --cpus "$THREADS" --mem 16G --time 04:00:00 --after "$j5" -- predict-genomes --manifest data/labeled_genomes.tsv --model models/phenotype_model.joblib --out results/genome_phenotype_predictions.tsv "${FEAT[@]}" --threads "$THREADS")
 j7=$($S --name mss_train_raw --cpus "$THREADS" --mem 32G --time 12:00:00 --after "$j4" -- train-raw --manifest data/labeled_genomes.tsv --out models --mixtures "$MIX" --threads "$THREADS")

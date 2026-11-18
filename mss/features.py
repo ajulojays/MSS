@@ -22,7 +22,7 @@ _LUT = np.full(256, 4, dtype=np.uint8)
 for _c, _v in zip(b"ACGTacgt", [0, 1, 2, 3, 0, 1, 2, 3]):
     _LUT[_c] = _v
 
-EMBEDDING_PREFIXES = ("dna_", "protein_", "f_")
+EMBEDDING_PREFIXES = ("dna_", "protein_", "f_", "kmer_")  # kmer_ = a table written by `mss features`
 CHUNK_BASES = 4_000_000
 
 
