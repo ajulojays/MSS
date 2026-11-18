@@ -306,7 +306,8 @@ def cmd_train(a):
         _die(f"--cv-group column {a.cv_group!r} not in manifest")
     X, ftype, _ = _features_for(m, a)
     bundle, report = train_heads(X, m, ftype, tasks=a.tasks, cv_group=a.cv_group, seed=a.seed,
-                                 class_filter=cf, report_by=a.report_by)
+                                 class_filter=cf, report_by=a.report_by, classifier=a.classifier,
+                                 threads=a.threads)
     bundle["k"] = a.k
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -551,6 +552,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--class-filter", action="append", metavar="TASK=CLASS,CLASS",
                    help="train TASK only on genomes whose label is one of these classes; other labels are "
                         "left out, not merged (repeatable), e.g. gram_stain=negative,positive")
+    p.add_argument("--classifier", choices=["logreg", "rf", "linsvc"], default="logreg",
+                   help="head type: logreg (scaled logistic regression, default), rf (500-tree random forest), "
+                        "linsvc (scaled linear SVM, sigmoid-calibrated probabilities); all untuned")
     p.add_argument("--seed", type=int, default=0)
     _add_feature_args(p)
     p.set_defaults(func=cmd_train)

@@ -132,6 +132,18 @@ def test_train_and_predict_heads():
     assert (pred["oxygen_prob_facultative"] == 0).all()  # class never seen in training
 
 
+@pytest.mark.parametrize("kind", ["rf", "linsvc"])
+def test_other_classifiers_train_and_predict(kind):
+    X, m = toy()
+    bundle, rep = train_heads(X, m, "test", classifier=kind, threads=2)
+    assert bundle["classifier"] == rep["classifier"] == kind
+    assert rep["tasks"]["oxygen"]["validation"]["balanced_accuracy"] > 0.8  # separable toy signal
+    pred = predict_heads(bundle, X)
+    pc = [f"oxygen_prob_{c}" for c in OXYGEN_CLASSES]
+    assert np.allclose(pred[pc].sum(axis=1), 1) and (pred.classifier == kind).all()
+    assert set(pred.oxygen_pred) <= {"anaerobe", "aerobe"}
+
+
 def test_class_filter_and_per_phylum_report():
     X, m = toy()
     m["phylum"] = ["P1" if g in ("G0", "G1") else "P2" for g in m["genus"]]

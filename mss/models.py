@@ -11,12 +11,15 @@ import uuid
 
 import numpy as np
 import pandas as pd
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
 
 from . import __version__
 from .ontology import TASK_LABELS, norm_text, valid_label
@@ -44,11 +47,47 @@ def task_labels(manifest: pd.DataFrame, task: str) -> pd.Series:
     return lab[keep]
 
 
-def make_classifier(seed: int):
-    return make_pipeline(
-        StandardScaler(),
-        LogisticRegression(max_iter=5000, class_weight="balanced", random_state=seed, C=1.0),
-    )
+CLASSIFIERS = ("logreg", "rf", "linsvc")
+
+
+class CalibratedLinearSVC(ClassifierMixin, BaseEstimator):
+    """Linear SVM whose class calls come from the SVM itself (class-balanced), with probabilities
+    from sigmoid calibration (3 internal folds, not group-aware: it shapes probabilities only)."""
+
+    def __init__(self, C=1.0, seed=0, max_iter=5000):
+        self.C, self.seed, self.max_iter = C, seed, max_iter
+
+    def _svc(self):
+        return make_pipeline(StandardScaler(), LinearSVC(C=self.C, class_weight="balanced",
+                                                         random_state=self.seed, max_iter=self.max_iter))
+
+    def fit(self, X, y):
+        self.svc_ = self._svc().fit(X, y)
+        self.cal_ = CalibratedClassifierCV(self._svc(), method="sigmoid", cv=3).fit(X, y)
+        self.classes_ = self.svc_.classes_
+        return self
+
+    def predict(self, X):
+        return self.svc_.predict(X)
+
+    def predict_proba(self, X):
+        return self.cal_.predict_proba(X)
+
+
+def make_classifier(seed: int, kind: str = "logreg", threads: int = 1):
+    """logreg (default): scaled L2 logistic regression. rf: 500-tree random forest (balanced class
+    weights per bootstrap). linsvc: scaled linear SVM, calibrated probabilities. All untuned."""
+    if kind == "logreg":
+        return make_pipeline(
+            StandardScaler(),
+            LogisticRegression(max_iter=5000, class_weight="balanced", random_state=seed, C=1.0),
+        )
+    if kind == "rf":
+        return RandomForestClassifier(n_estimators=500, class_weight="balanced_subsample",
+                                      n_jobs=threads, random_state=seed)
+    if kind == "linsvc":
+        return CalibratedLinearSVC(seed=seed)
+    raise ValueError(f"unknown classifier {kind!r}; choose from {CLASSIFIERS}")
 
 
 def group_cv(clf, X: np.ndarray, y: np.ndarray, groups: np.ndarray, seed: int) -> dict:
@@ -110,7 +149,8 @@ def train_heads(X: pd.DataFrame, manifest: pd.DataFrame, feature_type: str,
                 tasks=DEFAULT_TASKS,
                 cv_group: str = "genus", seed: int = 0,
                 class_filter: dict | None = None,
-                report_by: str | None = None) -> tuple[dict, dict]:
+                report_by: str | None = None, classifier: str = "logreg",
+                threads: int = 1) -> tuple[dict, dict]:
     """class_filter: {task: [classes]} trains that head only on those classes (e.g. OxyMetaG-style
     oxygen head on clear aerobes vs anaerobes). report_by: manifest column (e.g. gtdb_phylum) for
     per-stratum out-of-fold accuracy."""
@@ -134,7 +174,7 @@ def train_heads(X: pd.DataFrame, manifest: pd.DataFrame, feature_type: str,
             continue
         Xt = X.loc[lab.index].to_numpy(dtype=float)
         y = lab.to_numpy(dtype=object).astype(str)
-        clf = make_classifier(seed)
+        clf = make_classifier(seed, classifier, threads)
         if cv_group in meta.columns:
             groups = meta.loc[lab.index, cv_group].fillna("").astype(str).to_numpy()
             groups = np.where(groups == "", "unknown_" + lab.index.to_numpy(), groups)
@@ -166,12 +206,13 @@ def train_heads(X: pd.DataFrame, manifest: pd.DataFrame, feature_type: str,
         "feature_columns": list(X.columns),
         "heads": heads,
         "seed": seed,
+        "classifier": classifier,
         # fixed vocabularies keep all columns; open ones (cell_shape, ph_range) use fitted classes
         "task_labels": {t: (class_filter.get(t) or TASK_LABELS.get(t) or list(map(str, heads[t].classes_)))
                         for t in heads},
         "class_filter": class_filter,
     }
-    report.update({k: bundle[k] for k in ("model_id", "mss_version", "created", "feature_type", "seed")})
+    report.update({k: bundle[k] for k in ("model_id", "mss_version", "created", "feature_type", "seed", "classifier")})
     report["n_features"] = X.shape[1]
     report["note"] = ("Training-set fit is not reported as performance. 'validation' metrics come "
                       f"only from leave-{cv_group}-out folds.")
@@ -190,7 +231,8 @@ def predict_heads(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
         classes = list(map(str, m.classes_))
         for lab in bundle["task_labels"][task]:
             out[f"{task}_prob_{lab}"] = proba[:, classes.index(lab)] if lab in classes else 0.0
-        out[f"{task}_pred"] = np.array(classes)[proba.argmax(1)]
+        out[f"{task}_pred"] = m.predict(A).astype(str)  # = argmax proba except linsvc (SVM's own call)
     out["model_id"] = bundle["model_id"]
     out["feature_type"] = bundle["feature_type"]
+    out["classifier"] = bundle.get("classifier", "logreg")
     return out
